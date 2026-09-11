@@ -122,6 +122,7 @@ func extractMessagesImpl(
 	// included in the parent chain block.
 	batches, batchTxs, err := lookupBatches(
 		ctx,
+		state.BatchPostingTargetAddress,
 		parentChainHeader,
 		txFetcher,
 		logsFetcher,

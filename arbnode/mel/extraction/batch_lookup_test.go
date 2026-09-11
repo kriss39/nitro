@@ -36,6 +36,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		)
 		batches, txs, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			nil,
 			&mockBlockLogsFetcher{},
@@ -74,6 +75,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		}
 		_, _, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			txFetcher,
 			blockLogsFetcher,
@@ -114,6 +116,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		}
 		batches, txs, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			txFetcher,
 			blockLogsFetcher,
@@ -158,6 +161,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		}
 		batches, txs, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			txFetcher,
 			blockLogsFetcher,
@@ -185,8 +189,9 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		receipt := &types.Receipt{
 			Logs: []*types.Log{
 				{
-					Topics: []common.Hash{BatchDeliveredID},
-					Data:   packedLog,
+					Address: batchPostingTargetAddr,
+					Topics:  []common.Hash{BatchDeliveredID},
+					Data:    packedLog,
 				},
 			},
 		}
@@ -208,6 +213,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		}
 		_, _, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			txFetcher,
 			blockLogsFetcher,
@@ -233,9 +239,10 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		receipt := &types.Receipt{
 			Logs: []*types.Log{
 				{
-					Topics: []common.Hash{BatchDeliveredID},
-					Data:   packedLog,
-					TxHash: tx.Hash(),
+					Address: batchPostingTargetAddr,
+					Topics:  []common.Hash{BatchDeliveredID},
+					Data:    packedLog,
+					TxHash:  tx.Hash(),
 				},
 			},
 		}
@@ -257,6 +264,7 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		}
 		batches, txs, err := ParseBatchesFromBlock(
 			ctx,
+			batchPostingTargetAddr,
 			block.Header(),
 			txFetcher,
 			blockLogsFetcher,
@@ -272,6 +280,64 @@ func Test_parseBatchesFromBlock(t *testing.T) {
 		require.Equal(t, wantedBatch.AfterDelayedAcc, batches[0].AfterDelayedAcc)
 		require.Equal(t, wantedBatch.AfterDelayedCount, batches[0].AfterDelayedCount)
 	})
+}
+
+// The logs handed to ParseBatchesFromBlock are not necessarily pre-filtered: the
+// replay binary's fetcher returns every log in the parent chain block. Only the
+// sequencer inbox can deliver a batch, and a log with no topics at all must not be
+// indexed into.
+func Test_parseBatchesFromBlock_ignoresLogsThatAreNotBatches(t *testing.T) {
+	ctx := context.Background()
+	batchPostingTargetAddr := common.HexToAddress("0x1234567890123456789012345678901234567890")
+	otherAddr := common.HexToAddress("0x00000000000000000000000000000000deadbeef")
+	event, packedLog, _ := setupParseBatchesTest(t, big.NewInt(1))
+
+	for _, tt := range []struct {
+		name string
+		log  *types.Log
+	}{
+		{
+			name: "batch delivered event emitted by another contract",
+			log: &types.Log{
+				Address: otherAddr,
+				Topics:  []common.Hash{BatchDeliveredID},
+				Data:    packedLog,
+			},
+		},
+		{
+			name: "anonymous event with no topics",
+			log: &types.Log{
+				Address: otherAddr,
+				Topics:  nil,
+				Data:    packedLog,
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			blockHeader := &types.Header{}
+			block := types.NewBlock(blockHeader, &types.Body{}, nil, trie.NewStackTrie(nil))
+			receipt := &types.Receipt{
+				BlockHash: block.Hash(),
+				Logs:      []*types.Log{tt.log},
+			}
+			blockLogsFetcher := newMockBlockLogsFetcher([]*types.Receipt{receipt})
+			eventUnpacker := &mockEventUnpacker{
+				events: []*bridgegen.SequencerInboxSequencerBatchDelivered{event},
+				idx:    0,
+			}
+			batches, txs, err := ParseBatchesFromBlock(
+				ctx,
+				batchPostingTargetAddr,
+				block.Header(),
+				&mockTxFetcher{},
+				blockLogsFetcher,
+				eventUnpacker,
+			)
+			require.NoError(t, err)
+			require.Equal(t, 0, len(batches))
+			require.Equal(t, 0, len(txs))
+		})
+	}
 }
 
 func Test_parseBatchesFromBlock_outOfOrderBatches(t *testing.T) {
@@ -307,14 +373,16 @@ func Test_parseBatchesFromBlock_outOfOrderBatches(t *testing.T) {
 	receipt := &types.Receipt{
 		Logs: []*types.Log{
 			{
-				Topics: []common.Hash{BatchDeliveredID},
-				Data:   packedLog1,
-				TxHash: tx1.Hash(),
+				Address: batchPostingTargetAddr,
+				Topics:  []common.Hash{BatchDeliveredID},
+				Data:    packedLog1,
+				TxHash:  tx1.Hash(),
 			},
 			{
-				Topics: []common.Hash{BatchDeliveredID},
-				Data:   packedLog2,
-				TxHash: tx2.Hash(),
+				Address: batchPostingTargetAddr,
+				Topics:  []common.Hash{BatchDeliveredID},
+				Data:    packedLog2,
+				TxHash:  tx2.Hash(),
 			},
 		},
 	}
@@ -339,6 +407,7 @@ func Test_parseBatchesFromBlock_outOfOrderBatches(t *testing.T) {
 	}
 	_, _, err := ParseBatchesFromBlock(
 		ctx,
+		batchPostingTargetAddr,
 		block.Header(),
 		txFetcher,
 		blockLogsFetcher,

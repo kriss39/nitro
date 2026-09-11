@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 
 	"github.com/offchainlabs/nitro/arbnode/mel"
@@ -20,6 +21,7 @@ type EventUnpacker interface {
 
 func ParseBatchesFromBlock(
 	ctx context.Context,
+	batchPostingTargetAddress common.Address,
 	parentChainHeader *types.Header,
 	txFetcher TransactionFetcher,
 	logsFetcher LogsFetcher,
@@ -33,7 +35,15 @@ func ParseBatchesFromBlock(
 	batchTxs := make([]*types.Transaction, 0, len(logs))
 	var lastSeqNum *uint64
 	for _, log := range logs {
-		if log == nil || log.Topics[0] != BatchDeliveredID {
+		// These logs are not necessarily pre-filtered. The replay binary's fetcher
+		// hands over every log in the parent chain block, so a log may carry no
+		// topics at all (an anonymous event) and must not be indexed into.
+		if log == nil || len(log.Topics) == 0 || log.Topics[0] != BatchDeliveredID {
+			continue
+		}
+		// Only the sequencer inbox can deliver a batch. Any other contract can emit a
+		// log with the same signature, so the emitting address has to be checked.
+		if log.Address != batchPostingTargetAddress {
 			continue
 		}
 		event := new(bridgegen.SequencerInboxSequencerBatchDelivered)

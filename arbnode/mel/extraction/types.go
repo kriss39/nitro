@@ -31,6 +31,7 @@ func (*LogUnpacker) UnpackLogTo(
 // See: ParseBatchesFromBlock.
 type batchLookupFunc func(
 	ctx context.Context,
+	batchPostingTargetAddress common.Address,
 	parentChainHeader *types.Header,
 	txFetcher TransactionFetcher,
 	logsFetcher LogsFetcher,

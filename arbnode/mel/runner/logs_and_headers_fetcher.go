@@ -77,7 +77,7 @@ func (f *logsAndHeadersFetcher) fetch(ctx context.Context, preState *mel.State) 
 		wg.Done()
 	}()
 	go func() {
-		fetchLogsErr = f.fetchSequencerBatchLogs(ctx, parentChainBlockNumber, toBlock)
+		fetchLogsErr = f.fetchSequencerBatchLogs(ctx, parentChainBlockNumber, toBlock, preState.BatchPostingTargetAddress)
 		if fetchLogsErr == nil {
 			fetchLogsErr = f.fetchDelayedMessageLogs(ctx, parentChainBlockNumber, toBlock, preState.DelayedMessagePostingTargetAddress)
 		}
@@ -116,11 +116,12 @@ func (f *logsAndHeadersFetcher) fetchHeaders(ctx context.Context, from, to uint6
 	return nil
 }
 
-func (f *logsAndHeadersFetcher) fetchSequencerBatchLogs(ctx context.Context, from, to uint64) error {
+func (f *logsAndHeadersFetcher) fetchSequencerBatchLogs(ctx context.Context, from, to uint64, batchPostingTargetAddress common.Address) error {
 	sequencerBatchDataABI := melextraction.SeqInboxABI.Events["SequencerBatchData"].ID
 	query := ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(from),
 		ToBlock:   new(big.Int).SetUint64(to),
+		Addresses: []common.Address{batchPostingTargetAddress},
 		Topics:    [][]common.Hash{{melextraction.BatchDeliveredID, sequencerBatchDataABI}},
 	}
 	logs, err := f.parentChainReader.FilterLogs(ctx, query)
