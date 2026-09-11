@@ -24,6 +24,13 @@ import (
 // from the segments, possibly reading delayed messages when a delayed message
 // virtual segment in encountered, or at the end if we have not read enough
 // delayed messages in our MEL state when compared to the sequencer message's.
+//
+// The message stream produced here has to match the one the inbox multiplexer
+// (arbstate.NewInboxMultiplexer) produces for the same batch, so this mirrors
+// its control flow: empty and advancing segments are transparent, every other
+// segment yields exactly one message, segments past the end of the list are
+// read as "virtual" delayed message segments, and the batch ends as soon as
+// IsCachedSegementLast would report the current segment as the last one.
 func messagesFromBatchSegments(
 	ctx context.Context,
 	melState *mel.State,
@@ -33,54 +40,107 @@ func messagesFromBatchSegments(
 	messages := make([]*arbostypes.MessageWithMetadata, 0, len(seqMsg.Segments))
 	timestamp := uint64(0)
 	blockNumber := uint64(0)
-	segments := seqMsg.Segments
-	if len(segments) == 0 {
-		segments = [][]byte{{arbstate.BatchSegmentKindDelayedMessages}}
-	}
-	for idx, segment := range segments {
+	segmentNum := 0
+	for {
+		// Skip over empty segments and apply advancing segments, just like the
+		// multiplexer does before emitting each message.
+		for segmentNum < len(seqMsg.Segments) {
+			segment := seqMsg.Segments[segmentNum]
+			if len(segment) == 0 {
+				log.Warn("Empty segment in sequencer message", "seqMsg", seqMsg)
+				segmentNum++
+				continue
+			}
+			kind := segment[0]
+			if kind != arbstate.BatchSegmentKindAdvanceTimestamp && kind != arbstate.BatchSegmentKindAdvanceL1BlockNumber {
+				break
+			}
+			_, newBlockNumber, newTimestamp, err := messageFromSegment(
+				ctx,
+				melState,
+				delayedMsgDB,
+				seqMsg,
+				segmentNum,
+				segment,
+				timestamp,
+				blockNumber,
+			)
+			// An advancing segment we cannot parse is skipped, it does not produce a message.
+			if err != nil && !errors.Is(err, ErrParsingAdvancingSegment) {
+				return nil, fmt.Errorf(
+					"error parsing segment %d, delayedSeen: %d delayedRead: %d, err: %w", segmentNum, melState.DelayedMessagesSeen, melState.DelayedMessagesRead, err,
+				)
+			}
+			timestamp = newTimestamp
+			blockNumber = newBlockNumber
+			segmentNum++
+		}
+
+		// Past the end of the segment list the multiplexer reads a "virtual" delayed
+		// message segment, which is how batches that contain no message-producing
+		// segments still yield a message.
+		segment := []byte{arbstate.BatchSegmentKindDelayedMessages}
+		if segmentNum < len(seqMsg.Segments) {
+			segment = seqMsg.Segments[segmentNum]
+		} else {
+			log.Warn("reading virtual delayed message segment", "delayedMessagesRead", melState.DelayedMessagesRead, "afterDelayedMessages", seqMsg.AfterDelayedMessages)
+		}
 		msg, newBlockNumber, newTimestamp, err := messageFromSegment(
 			ctx,
 			melState,
 			delayedMsgDB,
 			seqMsg,
-			idx,
+			segmentNum,
 			segment,
 			timestamp,
 			blockNumber,
 		)
 		if err != nil {
-			if errors.Is(err, ErrParsingAdvancingSegment) {
-				continue // We ignore being able to parse an advance segment.
-			}
 			return nil, fmt.Errorf(
-				"error parsing segment %d, delayedSeen: %d delayedRead: %d, err: %w", idx, melState.DelayedMessagesSeen, melState.DelayedMessagesRead, err,
+				"error parsing segment %d, delayedSeen: %d delayedRead: %d, err: %w", segmentNum, melState.DelayedMessagesSeen, melState.DelayedMessagesRead, err,
 			)
 		}
 		timestamp = newTimestamp
 		blockNumber = newBlockNumber
 		if msg == nil {
-			continue
+			// The multiplexer turns a segment it could not turn into a message into an
+			// invalid message rather than dropping it.
+			msg = &arbostypes.MessageWithMetadata{
+				Message:             arbostypes.InvalidL1Message,
+				DelayedMessagesRead: melState.DelayedMessagesRead,
+			}
 		}
 		messages = append(messages, msg)
-	}
 
-	// If the mel state delayed messages read even after we completed reading
-	// all segments is less than the sequencer message's
-	// after delayed messages, we need to read more delayed messages here.
-	for melState.DelayedMessagesRead < seqMsg.AfterDelayedMessages {
-		msg, err := extractDelayedMessageFromSegment(
-			ctx,
-			melState,
-			seqMsg,
-			delayedMsgDB,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error extracting delayed message: %w", err)
+		if isLastSegment(melState, seqMsg, segmentNum) {
+			break
 		}
-		messages = append(messages, msg)
+		segmentNum++
 	}
 
 	return messages, nil
+}
+
+// isLastSegment mirrors arbstate.inboxMultiplexer.IsCachedSegementLast: the batch is
+// done once every delayed message it accounts for has been read and no segment after
+// the current one would produce a message.
+func isLastSegment(melState *mel.State, seqMsg *arbstate.SequencerMessage, segmentNum int) bool {
+	if melState.DelayedMessagesRead < seqMsg.AfterDelayedMessages {
+		return false
+	}
+	for i := segmentNum + 1; i < len(seqMsg.Segments); i++ {
+		segment := seqMsg.Segments[i]
+		if len(segment) == 0 {
+			continue
+		}
+		switch segment[0] {
+		case arbstate.BatchSegmentKindL2Message,
+			arbstate.BatchSegmentKindL2MessageBrotli,
+			arbstate.BatchSegmentKindDelayedMessages:
+			return false
+		}
+	}
+	return true
 }
 
 var ErrParsingAdvancingSegment = fmt.Errorf("error parsing advancing segment")

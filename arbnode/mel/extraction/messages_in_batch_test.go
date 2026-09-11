@@ -327,6 +327,85 @@ func Test_messagesFromBatchSegments(t *testing.T) {
 	}
 }
 
+// A batch whose segments produce no messages at all must still yield exactly one
+// message, because the inbox multiplexer falls back to a virtual delayed message
+// segment once it runs out of segments. Returning no messages here would make the
+// MEL message count disagree with the multiplexer's for the same batch.
+func Test_messagesFromBatchSegments_noMessageProducingSegments(t *testing.T) {
+	encodedAdvance, _ := rlp.EncodeToBytes(uint64(7))
+	for _, tt := range []struct {
+		name     string
+		segments [][]byte
+	}{
+		{
+			name:     "no segments at all",
+			segments: [][]byte{},
+		},
+		{
+			name:     "only a single empty segment",
+			segments: [][]byte{{}},
+		},
+		{
+			name: "only advancing segments",
+			segments: [][]byte{
+				append([]byte{arbstate.BatchSegmentKindAdvanceTimestamp}, encodedAdvance...),
+				append([]byte{arbstate.BatchSegmentKindAdvanceL1BlockNumber}, encodedAdvance...),
+			},
+		},
+		{
+			name:     "only an unparseable advancing segment",
+			segments: [][]byte{{arbstate.BatchSegmentKindAdvanceTimestamp, 0xff}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			melState := &mel.State{DelayedMessagesRead: 0}
+			seqMsg := sequencerMessageWithSegments(0, tt.segments)
+			msgs, err := messagesFromBatchSegments(
+				context.Background(),
+				melState,
+				seqMsg,
+				&mockDelayedMessageDB{},
+			)
+			require.NoError(t, err)
+			require.Len(t, msgs, 1)
+			require.Equal(t, arbostypes.InvalidL1Message, msgs[0].Message)
+		})
+	}
+}
+
+// Segments the multiplexer does not know how to turn into a message are only emitted
+// while a later segment still produces one, so a trailing unknown segment is dropped
+// while one that precedes a real message becomes an invalid message.
+func Test_messagesFromBatchSegments_unknownSegments(t *testing.T) {
+	const unknownSegmentKind = 0x7f
+	l2Segment := append([]byte{arbstate.BatchSegmentKindL2Message}, []byte("foobar")...)
+
+	t.Run("trailing unknown segment is dropped", func(t *testing.T) {
+		msgs, err := messagesFromBatchSegments(
+			context.Background(),
+			&mel.State{},
+			sequencerMessageWithSegments(0, [][]byte{l2Segment, {unknownSegmentKind}}),
+			&mockDelayedMessageDB{},
+		)
+		require.NoError(t, err)
+		require.Len(t, msgs, 1)
+		require.Equal(t, []byte("foobar"), msgs[0].Message.L2msg)
+	})
+
+	t.Run("unknown segment before a message becomes an invalid message", func(t *testing.T) {
+		msgs, err := messagesFromBatchSegments(
+			context.Background(),
+			&mel.State{},
+			sequencerMessageWithSegments(0, [][]byte{{unknownSegmentKind}, l2Segment}),
+			&mockDelayedMessageDB{},
+		)
+		require.NoError(t, err)
+		require.Len(t, msgs, 2)
+		require.Equal(t, arbostypes.InvalidL1Message, msgs[0].Message)
+		require.Equal(t, []byte("foobar"), msgs[1].Message.L2msg)
+	})
+}
+
 type mockDelayedMessageDB struct {
 	DelayedMessagesRead uint64
 	DelayedMessages     map[uint64]*mel.DelayedInboxMessage
